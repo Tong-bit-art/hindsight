@@ -33,17 +33,19 @@ import time
 from datetime import datetime
 from typing import Any
 
-from ...config import DEFAULT_GRAPH_SEED_MIN_SIMILARITY, get_config
-from ..db.ops import LinkExpansionRows, UpdatedWindow
-from ..db_utils import acquire_with_retry
-from ..memory_engine import fq_table
-from .graph_retrieval import GraphRetriever
-from .tags import TagGroup, TagsMatch, filter_results_by_tag_groups, filter_results_by_tags
-from .types import GraphRetrieval, GraphRetrievalTimings, RetrievalResult
+from ....config import DEFAULT_GRAPH_SEED_MIN_SIMILARITY, get_config
+from ...db.ops import LinkExpansionRows, UpdatedWindow
+from ...db_utils import acquire_with_retry
+
+# The guard-free resolver under the name every pg/ function uses: this retriever is the
+# Postgres store's graph arm, so the store tables are its own (#4969).
+from ...schema import fq_store_table as fq_table
+from ...search.graph_retrieval import GraphRetriever
+from ...search.tags import TagGroup, TagsMatch, filter_results_by_tag_groups, filter_results_by_tags
+from ...search.types import GraphRetrieval, GraphRetrievalTimings, RetrievalResult
+from ..base import GRAPH_SEED_LIMIT
 
 logger = logging.getLogger(__name__)
-
-GRAPH_SEED_LIMIT = 20
 
 
 async def _find_semantic_seeds(
@@ -60,7 +62,7 @@ async def _find_semantic_seeds(
     created_before: datetime | None = None,
 ) -> list[RetrievalResult]:
     """Find semantic seeds via embedding search."""
-    from .tags import build_tag_groups_where_clause, build_tags_where_clause_simple
+    from ...search.tags import build_tag_groups_where_clause, build_tags_where_clause_simple
 
     tags_clause = build_tags_where_clause_simple(tags, 6, match=tags_match)
     tag_groups_param_start = 6 + (1 if tags else 0)
@@ -69,7 +71,7 @@ async def _find_semantic_seeds(
     groups_params = built.params
 
     # created_after/created_before filter `updated_at`, matching the other recall arms
-    # (see retrieval.py) so a window narrows every arm the same way.
+    # (see recall.py) so a window narrows every arm the same way.
     _next_idx = tag_groups_param_start + len(groups_params)
     updated_range_clause = ""
     updated_range_params: list[Any] = []
@@ -417,13 +419,26 @@ class LinkExpansionRetriever(GraphRetriever):
         # junction table with standard SQL joins (previously PG used native array
         # ops and Oracle used JSON_TABLE).
         # $1 seeds, $2 budget — the window binds after them.
-        return await ops.expand_observations(
-            conn,
-            mu,
-            ue,
-            ml,
-            seed_ids,
-            budget,
-            per_entity_limit,
-            UpdatedWindow(after=created_after, before=created_before, first_param_index=3),
-        )
+        # Same deadline as _expand_combined (#4529): the three arms are fused into
+        # one query, so there is no cheaper fallback — the graph arm yields nothing
+        # and recall continues on its other strategies.
+        try:
+            return await asyncio.wait_for(
+                ops.expand_observations(
+                    conn,
+                    mu,
+                    ue,
+                    ml,
+                    seed_ids,
+                    budget,
+                    per_entity_limit,
+                    UpdatedWindow(after=created_after, before=created_before, first_param_index=3),
+                ),
+                timeout=config.link_expansion_timeout,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"[LinkExpansion] Observation expansion timed out after {config.link_expansion_timeout}s, "
+                "skipping graph results for fact_type=observation"
+            )
+            return LinkExpansionRows(entity=[], semantic=[], causal=[])
