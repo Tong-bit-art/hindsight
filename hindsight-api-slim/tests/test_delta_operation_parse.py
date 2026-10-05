@@ -462,3 +462,18 @@ async def test_request_delta_operations_delivers_the_retry_to_a_strict_provider(
 
     assert len(llm.calls) == 2
     assert op_list.operations[0].section_id == "s"
+
+
+async def test_request_delta_operations_replays_a_validated_reply_as_text():
+    """The same hazard one type further along: a call that validates its
+    ``response_format`` gets the parsed model back rather than a dict. It reaches the
+    retry through the reference path too (#4206) — a well-formed op can still name a
+    section the document does not have."""
+    llm = _StrictBodyLLM(
+        DeltaOperationList(operations=[AppendBlockOp(section_id="gone", text="ok")]),
+        _KNOWN_SECTION,
+    )
+    op_list = await request_delta_operations(llm, system_prompt="sys", user_prompt="usr", scope="test", document=_DOC)
+
+    assert len(llm.calls) == 2
+    assert op_list.operations[0].section_id == "prefs"
